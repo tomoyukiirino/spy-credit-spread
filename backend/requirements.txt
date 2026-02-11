@@ -1,0 +1,13 @@
+# FastAPI + Backend
+fastapi>=0.109
+uvicorn[standard]>=0.27
+websockets>=12.0
+pydantic>=2.5
+python-multipart>=0.0.6
+
+# 既存依存関係
+ib_insync>=0.9.86
+pandas>=2.0
+tabulate>=0.9
+pytz>=2023.3
+requests>=2.31
