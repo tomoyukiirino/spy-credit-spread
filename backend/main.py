@@ -106,10 +106,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS設定（localhost:3000からのアクセスを許可）
+# CORS設定（開発環境：localhost全ポート許可）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3002",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -117,7 +123,7 @@ app.add_middleware(
 
 
 # ルーター登録
-from routers import account, market, options, positions, fx, chat, strategy
+from routers import account, market, options, positions, fx, chat, strategy, trades
 app.include_router(account.router, prefix="/api", tags=["Account"])
 app.include_router(market.router, prefix="/api", tags=["Market"])
 app.include_router(options.router, prefix="/api", tags=["Options"])
@@ -125,6 +131,7 @@ app.include_router(positions.router, prefix="/api", tags=["Positions"])
 app.include_router(fx.router, prefix="/api", tags=["FX"])
 app.include_router(chat.router, prefix="/api", tags=["Chat"])
 app.include_router(strategy.router, prefix="/api", tags=["Strategy"])
+app.include_router(trades.router, prefix="/api", tags=["Trades"])
 
 
 @app.get("/")

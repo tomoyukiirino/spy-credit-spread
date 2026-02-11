@@ -3,7 +3,7 @@
  * WebSocket接続とリアルタイムデータ更新を管理
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { getWebSocketClient, WebSocketMessage } from '@/lib/websocket';
 
 interface UseWebSocketOptions {
@@ -16,6 +16,15 @@ export function useWebSocket(channels: string[] = [], options: UseWebSocketOptio
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
+  // channelsを安定した文字列に変換して無限ループを防ぐ
+  const channelsKey = useMemo(() => channels.sort().join(','), [channels.join(',')]);
+  const channelsRef = useRef<string[]>(channels);
+
+  // channelsKeyが変わった時だけchannelsRefを更新
+  useEffect(() => {
+    channelsRef.current = channels;
+  }, [channelsKey]);
+
   const connect = useCallback(async () => {
     try {
       const client = getWebSocketClient();
@@ -25,17 +34,22 @@ export function useWebSocket(channels: string[] = [], options: UseWebSocketOptio
         setIsConnected(true);
         setError(null);
 
-        // チャンネルを購読
-        channels.forEach((channel) => {
-          client.subscribe(channel);
-        });
+        // 接続確立後、少し待ってからチャンネルを購読
+        setTimeout(() => {
+          channelsRef.current.forEach((channel) => {
+            client.subscribe(channel);
+          });
+        }, 100);
       }
     } catch (err) {
-      console.error('[useWebSocket] Connection failed:', err);
+      // エラーメッセージがある場合のみログ出力
+      if (err instanceof Error && err.message) {
+        console.error('[useWebSocket] Connection failed:', err.message);
+      }
       setError(err instanceof Error ? err : new Error('Connection failed'));
       setIsConnected(false);
     }
-  }, [channels]);
+  }, []);
 
   const disconnect = useCallback(() => {
     const client = getWebSocketClient();
@@ -43,17 +57,28 @@ export function useWebSocket(channels: string[] = [], options: UseWebSocketOptio
     setIsConnected(false);
   }, []);
 
+  // 初回接続のみ（channelsKeyは含めない = 再接続しない）
   useEffect(() => {
     if (autoConnect) {
       connect();
     }
 
+    // クリーンアップ関数では切断しない
+    // （シングルトンWebSocketは他のコンポーネントでも使用されている可能性があるため）
     return () => {
-      if (autoConnect) {
-        disconnect();
-      }
+      // 何もしない - WebSocketは共有リソース
     };
   }, [autoConnect, connect, disconnect]);
+
+  // channelsが変更されたら購読を更新（接続は維持）
+  useEffect(() => {
+    const client = getWebSocketClient();
+    if (client.isConnected()) {
+      channelsRef.current.forEach((channel) => {
+        client.subscribe(channel);
+      });
+    }
+  }, [channelsKey]);
 
   useEffect(() => {
     if (onMessage) {

@@ -183,3 +183,46 @@ async def get_unrealized_pnl(spread_id: str, current_premium: float):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to calculate unrealized P&L: {str(e)}")
+
+
+@router.get("/positions/pnl-history")
+async def get_pnl_history(range: str = 'week'):
+    """
+    P&L履歴を取得（チャート用）
+
+    Args:
+        range: 期間（day/week/month/all）
+
+    Returns:
+        dict: P&L履歴データ
+    """
+    from datetime import datetime, timedelta
+    import pytz
+
+    # モックデータを返す（実装時はDBから取得）
+    now = datetime.now(pytz.UTC)
+
+    if range == 'day':
+        days = 1
+    elif range == 'week':
+        days = 7
+    elif range == 'month':
+        days = 30
+    else:  # all
+        days = 90
+
+    data = []
+    for i in range(days):
+        date = now - timedelta(days=days - i - 1)
+        # モックデータ（実際にはDBから取得）
+        data.append({
+            'date': date.strftime('%Y-%m-%d'),
+            'realized_pnl': 0,
+            'unrealized_pnl': 0,
+            'total_pnl': 0
+        })
+
+    return {
+        'range': range,
+        'data': data
+    }
