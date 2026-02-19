@@ -38,7 +38,7 @@ FX_RATE_SOURCE = 'IBKR'  # IBKRから取得、フォールバックあり
 EXCHANGERATE_API_KEY = '10d7371bade6881b469228b4'  # exchangerate-api.com APIキー
 
 # マーケットデータ設定
-MARKET_DATA_TYPE = 3  # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
+MARKET_DATA_TYPE = 1  # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
 REQUEST_TIMEOUT = 10  # タイムアウト秒数
 
 # モックデータ設定（開発・テスト用）

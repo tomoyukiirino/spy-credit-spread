@@ -142,12 +142,148 @@ async def get_spread_candidates():
             raise HTTPException(status_code=500, detail=f"Failed to get spread candidates: {str(e)}")
 
     else:
-        # リアルモード: 簡易実装（後で詳細実装）
-        return {
-            "candidates_count": 0,
-            "candidates": [],
-            "note": "Real mode spread calculation requires additional implementation"
-        }
+        # リアルモード: IBKRからオプションデータを取得
+        from backend.services.ibkr_service import IBKRService
+        from ib_insync import Stock, Option
+        from datetime import datetime
+        import math
+
+        service = app_state.get('ibkr_service')
+        if not service or not service.is_connected:
+            raise HTTPException(status_code=503, detail="IBKR not connected")
+
+        try:
+            def _fetch_spread_candidates(ib):
+                # 1. SPY現在価格を取得
+                spy_contract = Stock('SPY', 'SMART', 'USD')
+                ib.qualifyContracts(spy_contract)
+                ib.reqMktData(spy_contract, '', False, False)
+                ib.sleep(2)
+                spy_ticker = ib.ticker(spy_contract)
+                ib.cancelMktData(spy_contract)
+
+                spy_price = spy_ticker.last
+                if not spy_price or math.isnan(spy_price):
+                    spy_price = spy_ticker.close
+                if not spy_price or math.isnan(spy_price):
+                    bid = spy_ticker.bid if spy_ticker.bid and not math.isnan(spy_ticker.bid) else 0
+                    ask = spy_ticker.ask if spy_ticker.ask and not math.isnan(spy_ticker.ask) else 0
+                    spy_price = (bid + ask) / 2 if bid and ask else 580
+
+                # 2. オプションチェーンのパラメータを取得
+                chains = ib.reqSecDefOptParams('SPY', '', 'STK', spy_contract.conId)
+                if not chains:
+                    return []
+
+                # SMART取引所のチェーンを優先
+                chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
+
+                # 3. DTE範囲でフィルタリング
+                today = datetime.now().date()
+                valid_expirations = []
+                for exp_str in sorted(chain.expirations):
+                    exp_date = datetime.strptime(exp_str, '%Y%m%d').date()
+                    dte = (exp_date - today).days
+                    if config.MIN_DTE <= dte <= config.MAX_DTE:
+                        valid_expirations.append((exp_str, exp_date, dte))
+
+                if not valid_expirations:
+                    return []
+
+                # 4. ATM近辺のストライクに絞る（SPY価格の85%〜100%）
+                target_strikes_all = sorted([
+                    s for s in chain.strikes
+                    if spy_price * 0.85 <= s < spy_price
+                ])
+                target_strikes = target_strikes_all[-15:] if len(target_strikes_all) > 15 else target_strikes_all
+
+                candidates = []
+
+                # 5. 各期限についてオプションデータを取得（最大2期限）
+                for exp_str, exp_date, dte in valid_expirations[:2]:
+                    option_contracts = [
+                        Option('SPY', exp_str, strike, 'P', 'SMART')
+                        for strike in target_strikes
+                    ]
+
+                    # 契約を検証
+                    try:
+                        ib.qualifyContracts(*option_contracts)
+                        option_contracts = [c for c in option_contracts if c.conId]
+                    except Exception:
+                        continue
+
+                    if not option_contracts:
+                        continue
+
+                    # マーケットデータをリクエスト（Greeksを含む）
+                    tickers_map = {}
+                    for opt in option_contracts:
+                        t = ib.reqMktData(opt, '100,101,105,106', False, False)
+                        tickers_map[opt.strike] = (opt, t)
+
+                    ib.sleep(4)  # データ到着を待つ
+
+                    for strike, (opt, ticker) in tickers_map.items():
+                        ib.cancelMktData(opt)
+
+                        if not ticker:
+                            continue
+
+                        # デルタを取得（modelGreeks > bidGreeks > lastGreeks の順）
+                        greeks = ticker.modelGreeks or ticker.bidGreeks or ticker.lastGreeks
+                        delta = None
+                        iv = None
+                        if greeks:
+                            if greeks.delta is not None and not math.isnan(greeks.delta):
+                                delta = greeks.delta
+                            if greeks.impliedVol is not None and not math.isnan(greeks.impliedVol):
+                                iv = greeks.impliedVol
+
+                        abs_delta = abs(delta) if delta is not None else None
+
+                        # bid/ask/mid
+                        bid = ticker.bid if ticker.bid and not math.isnan(ticker.bid) and ticker.bid > 0 else None
+                        ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) and ticker.ask > 0 else None
+                        mid = (bid + ask) / 2 if bid and ask else None
+
+                        if not mid or mid <= 0:
+                            continue
+
+                        long_strike = strike - config.SPREAD_WIDTH
+                        max_profit = mid * 100
+                        max_loss = (config.SPREAD_WIDTH - mid) * 100 if mid < config.SPREAD_WIDTH else None
+                        win_prob = (1 - abs_delta) if abs_delta is not None else None
+                        score = (win_prob * max_profit / max_loss) if (win_prob and max_loss and max_loss > 0) else 0
+
+                        candidates.append({
+                            'short_strike': strike,
+                            'long_strike': long_strike,
+                            'expiry': exp_str,
+                            'exp_date': exp_date.strftime('%Y-%m-%d'),
+                            'dte': dte,
+                            'short_delta': abs_delta,
+                            'short_iv': iv,
+                            'spread_premium_mid': mid,
+                            'max_profit': max_profit,
+                            'max_loss': max_loss,
+                            'risk_reward_ratio': max_loss / max_profit if (max_profit and max_loss) else None,
+                            'win_probability': win_prob,
+                            'score': score,
+                        })
+
+                candidates.sort(key=lambda x: x['score'], reverse=True)
+                return candidates
+
+            candidates = await service.execute(_fetch_spread_candidates, service.ib)
+
+            return {
+                "candidates_count": len(candidates),
+                "candidates": candidates
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to get spread candidates: {str(e)}")
 
 
 @router.post("/options/calculate-spread")
