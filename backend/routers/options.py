@@ -175,8 +175,9 @@ async def get_spread_candidates():
                 if not chains:
                     return []
 
-                # SMART取引所のチェーンを優先
-                chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
+                # 最も多くの期限を持つチェーンを選択（近期オプションを含む）
+                # ※ SMARTチェーンは近期オプションを含まないため、最大チェーンを使用
+                chain = max(chains, key=lambda c: len(c.expirations))
 
                 # 3. DTE範囲でフィルタリング
                 today = datetime.now().date()
@@ -201,8 +202,9 @@ async def get_spread_candidates():
 
                 # 5. 各期限についてオプションデータを取得（最大2期限）
                 for exp_str, exp_date, dte in valid_expirations[:2]:
+                    # tradingClass='SPY'を指定してAmbiguous contractエラーを回避
                     option_contracts = [
-                        Option('SPY', exp_str, strike, 'P', 'SMART')
+                        Option('SPY', exp_str, strike, 'P', 'SMART', tradingClass='SPY')
                         for strike in target_strikes
                     ]
 
@@ -210,7 +212,9 @@ async def get_spread_candidates():
                     try:
                         ib.qualifyContracts(*option_contracts)
                         option_contracts = [c for c in option_contracts if c.conId]
-                    except Exception:
+                    except Exception as qe:
+                        import logging
+                        logging.getLogger(__name__).warning(f'qualifyContracts failed for {exp_str}: {qe}')
                         continue
 
                     if not option_contracts:
@@ -222,7 +226,7 @@ async def get_spread_candidates():
                         t = ib.reqMktData(opt, '100,101,105,106', False, False)
                         tickers_map[opt.strike] = (opt, t)
 
-                    ib.sleep(4)  # データ到着を待つ
+                    ib.sleep(5)  # データ到着を待つ
 
                     for strike, (opt, ticker) in tickers_map.items():
                         ib.cancelMktData(opt)
@@ -247,14 +251,11 @@ async def get_spread_candidates():
                         ask = ticker.ask if ticker.ask and not math.isnan(ticker.ask) and ticker.ask > 0 else None
                         mid = (bid + ask) / 2 if bid and ask else None
 
-                        if not mid or mid <= 0:
-                            continue
-
                         long_strike = strike - config.SPREAD_WIDTH
-                        max_profit = mid * 100
-                        max_loss = (config.SPREAD_WIDTH - mid) * 100 if mid < config.SPREAD_WIDTH else None
+                        max_profit = mid * 100 if mid else None
+                        max_loss = (config.SPREAD_WIDTH - mid) * 100 if (mid and mid < config.SPREAD_WIDTH) else None
                         win_prob = (1 - abs_delta) if abs_delta is not None else None
-                        score = (win_prob * max_profit / max_loss) if (win_prob and max_loss and max_loss > 0) else 0
+                        score = (win_prob * max_profit / max_loss) if (win_prob and max_profit and max_loss and max_loss > 0) else 0
 
                         candidates.append({
                             'short_strike': strike,
@@ -275,7 +276,8 @@ async def get_spread_candidates():
                 candidates.sort(key=lambda x: x['score'], reverse=True)
                 return candidates
 
-            candidates = await service.execute(_fetch_spread_candidates, service.ib)
+            # タイムアウトを60秒に延長（複数期限のデータ取得に時間がかかるため）
+            candidates = await service.execute_timeout(60, _fetch_spread_candidates, service.ib)
 
             return {
                 "candidates_count": len(candidates),

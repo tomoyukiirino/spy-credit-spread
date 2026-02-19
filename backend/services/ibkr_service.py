@@ -174,6 +174,83 @@ class IBKRService:
         """execute()のエイリアス（後方互換性用）"""
         return await self.execute(func, *args, **kwargs)
 
+    async def execute_timeout(self, timeout: int, func: Callable, *args, **kwargs) -> Any:
+        """タイムアウトを指定してexecute()を実行"""
+        future = self.execute_sync(func, *args, **kwargs)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, future.result, timeout)
+
+    async def setup_streaming(self):
+        """
+        SPYとUSD/JPYの永続的なマーケットデータ購読を開始。
+        起動時に1回だけ呼ぶ。以降はget_streaming_*()でデータを読み取る。
+        """
+        def _setup(ib):
+            from ib_insync import Stock, Forex
+            spy = Stock('SPY', 'SMART', 'USD')
+            ib.qualifyContracts(spy)
+            spy_ticker = ib.reqMktData(spy, '', False, False)
+            ib.sleep(2)  # 初回データ到着を待つ
+
+            try:
+                fx = Forex('USDJPY')
+                ib.qualifyContracts(fx)
+                fx_ticker = ib.reqMktData(fx, '', False, False)
+                ib.sleep(1)
+            except Exception:
+                fx_ticker = None
+
+            return {'spy': spy_ticker, 'fx': fx_ticker}
+
+        tickers = await self.execute(_setup, self.ib)
+        self._streaming_tickers = tickers
+        logger.info("✓ SPY/FXストリーミング開始")
+        return tickers
+
+    def get_streaming_spy_price(self) -> Optional[dict]:
+        """SPYのリアルタイム価格を返す（ワーカースレッドが随時更新）"""
+        import math
+
+        tickers = getattr(self, '_streaming_tickers', {})
+        spy = tickers.get('spy') if tickers else None
+        if not spy:
+            return None
+
+        def _v(val):
+            return val if val is not None and not math.isnan(val) else None
+
+        last = _v(spy.last)
+        bid = _v(spy.bid)
+        ask = _v(spy.ask)
+        mid = ((bid + ask) / 2) if (bid and ask) else last
+
+        if not last and not mid:
+            return None
+
+        return {'last': last or mid, 'bid': bid, 'ask': ask, 'mid': mid}
+
+    def get_streaming_fx_rate(self) -> Optional[dict]:
+        """USD/JPYのリアルタイムレートを返す"""
+        import math
+
+        tickers = getattr(self, '_streaming_tickers', {})
+        fx = tickers.get('fx') if tickers else None
+        if not fx:
+            return None
+
+        def _v(val):
+            return val if val is not None and not math.isnan(val) else None
+
+        last = _v(fx.last)
+        bid = _v(fx.bid)
+        ask = _v(fx.ask)
+        rate = last or ((bid + ask) / 2 if (bid and ask) else None)
+
+        if not rate:
+            return None
+
+        return {'usd_jpy': rate, 'source': 'IBKR'}
+
 
 # --- Depends用のヘルパー関数 ---
 

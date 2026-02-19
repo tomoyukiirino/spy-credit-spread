@@ -5,6 +5,7 @@ SPY Bull Put Credit Spread ダッシュボードのバックエンドAPI
 
 import sys
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +29,37 @@ app_state = {
     'position_manager': None,
     'logger': None
 }
+
+
+async def _broadcast_real_time_data(service):
+    """
+    リアルモード用: IBKRストリーミングデータをWebSocket経由でブロードキャスト（3秒ごと）
+    """
+    from ws.manager import manager
+
+    while True:
+        try:
+            if manager.get_connection_count() > 0:
+                spy_data = service.get_streaming_spy_price()
+                if spy_data:
+                    await manager.broadcast({
+                        'type': 'spy_price',
+                        'data': spy_data,
+                        'timestamp': datetime.now(pytz.UTC).isoformat()
+                    }, channel='spy')
+
+                fx_data = service.get_streaming_fx_rate()
+                if fx_data:
+                    await manager.broadcast({
+                        'type': 'fx_rate',
+                        'data': fx_data,
+                        'timestamp': datetime.now(pytz.UTC).isoformat()
+                    }, channel='fx')
+
+        except Exception as e:
+            pass  # ブロードキャストエラーは無視して継続
+
+        await asyncio.sleep(3)
 
 
 @asynccontextmanager
@@ -83,6 +115,15 @@ async def lifespan(app: FastAPI):
 
         app_state['ibkr_service'] = service
         app_state['position_manager'] = PositionManager()
+
+        # ストリーミングとWebSocketブロードキャストを開始
+        if service.is_connected:
+            try:
+                await service.setup_streaming()
+                asyncio.create_task(_broadcast_real_time_data(service))
+                logger.info('✓ リアルタイムストリーミング開始')
+            except Exception as e:
+                logger.warning(f'⚠️ ストリーミング開始失敗: {e}')
 
     logger.info('FastAPI Dashboard Ready')
     logger.info('=' * 60)
