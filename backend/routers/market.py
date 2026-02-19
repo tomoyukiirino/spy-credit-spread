@@ -131,21 +131,31 @@ async def get_vix_level():
             raise HTTPException(status_code=503, detail="IBKR not connected")
 
         try:
-            # VIX契約を作成
-            contract = Index('VIX', 'CBOE')
+            def _fetch_vix(ib):
+                contract = Index('VIX', 'CBOE')
+                ib.qualifyContracts(contract)
+                ib.reqMktData(contract, '', False, False)
+                ib.sleep(2)
+                ticker = ib.ticker(contract)
+                ib.cancelMktData(contract)
 
-            # 契約を検証
-            await service.run(service.ib.qualifyContracts, contract)
+                last = ticker.last if ticker.last == ticker.last else None
+                close = ticker.close if ticker.close == ticker.close else None
+                bid = ticker.bid if ticker.bid == ticker.bid else None
+                ask = ticker.ask if ticker.ask == ticker.ask else None
 
-            # マーケットデータをリクエスト
-            ticker = await service.run_with_sleep(service.ib.reqMktData, 2.0, contract)
+                return {
+                    'vix': last or close,
+                    'bid': bid,
+                    'ask': ask,
+                }
 
-            vix_value = ticker.last if ticker.last else ticker.close
+            data = await service.execute(_fetch_vix, service.ib)
 
             return {
-                "vix": vix_value,
-                "bid": ticker.bid,
-                "ask": ticker.ask,
+                "vix": data['vix'],
+                "bid": data['bid'],
+                "ask": data['ask'],
                 "timestamp": datetime.now(pytz.UTC).isoformat(),
                 "is_delayed": (config.MARKET_DATA_TYPE == 3 or config.MARKET_DATA_TYPE == 4)
             }

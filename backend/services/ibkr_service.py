@@ -170,6 +170,10 @@ class IBKRService:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, future.result, 30)  # 30秒タイムアウト
 
+    async def run(self, func: Callable, *args, **kwargs) -> Any:
+        """execute()のエイリアス（後方互換性用）"""
+        return await self.execute(func, *args, **kwargs)
+
 
 # --- Depends用のヘルパー関数 ---
 

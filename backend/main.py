@@ -69,16 +69,20 @@ async def lifespan(app: FastAPI):
 
         # 新しいIBKRServiceを使用（専用スレッドでイベントループ競合を回避）
         service = IBKRService.get_instance()
-        service.start(
-            host=config.TWS_HOST,
-            port=config.TWS_PORT,
-            client_id=config.CLIENT_ID
-        )
+        try:
+            service.start(
+                host=config.TWS_HOST,
+                port=config.TWS_PORT,
+                client_id=config.CLIENT_ID
+            )
+            logger.info('✓ IBKR接続確立（専用スレッド）')
+        except Exception as e:
+            logger.warning(f'⚠️ IBKR接続失敗（TWSが起動しているか確認してください）: {e}')
+            logger.warning(f'   接続先: {config.TWS_HOST}:{config.TWS_PORT}')
+            logger.warning('   サーバーは起動しますが、IBKRデータは利用できません')
 
         app_state['ibkr_service'] = service
         app_state['position_manager'] = PositionManager()
-
-        logger.info('✓ IBKR接続確立（専用スレッド）')
 
     logger.info('FastAPI Dashboard Ready')
     logger.info('=' * 60)

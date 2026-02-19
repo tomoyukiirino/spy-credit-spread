@@ -42,7 +42,7 @@ MARKET_DATA_TYPE = 3  # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen
 REQUEST_TIMEOUT = 10  # タイムアウト秒数
 
 # モックデータ設定（開発・テスト用）
-USE_MOCK_DATA = True  # Falseの場合、実際のIBKR接続を使用（TWSが必要）
+USE_MOCK_DATA = False  # Falseの場合、実際のIBKR接続を使用（TWSが必要）
 
 # 自動実行設定
 AUTO_EXECUTE = True  # Trueの場合、注文前の確認プロンプトをスキップ（完全自動売買）
