@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 import pytz
 from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # .envファイルを読み込み
 load_dotenv()
@@ -29,6 +31,9 @@ app_state = {
     'position_manager': None,
     'logger': None
 }
+
+# APScheduler インスタンス（グローバル）
+scheduler = AsyncIOScheduler(timezone=pytz.timezone('US/Eastern'))
 
 
 async def _broadcast_real_time_data(service):
@@ -60,6 +65,46 @@ async def _broadcast_real_time_data(service):
             pass  # ブロードキャストエラーは無視して継続
 
         await asyncio.sleep(3)
+
+
+def _setup_scheduler(service):
+    """
+    APScheduler を設定・起動する
+
+    スケジュール:
+    - 月曜 09:35 ET: 自動エントリー（Bull Put Spread 発注）
+    """
+    from backend.services.auto_trader import run_auto_entry, set_scheduler_active
+
+    entry_hour, entry_minute = config.ENTRY_TIME.split(':')
+
+    async def _scheduled_entry():
+        _logger = get_logger()
+        _logger.info(f'[スケジューラー] 自動エントリー起動 ({config.ENTRY_TIME} ET)')
+        result = await run_auto_entry(service)
+        if result.get('success'):
+            _logger.info(f'[スケジューラー] エントリー完了: {result}')
+        else:
+            _logger.warning(f'[スケジューラー] エントリー見送り: {result.get("reason")}')
+
+    scheduler.add_job(
+        _scheduled_entry,
+        CronTrigger(
+            day_of_week='mon',
+            hour=int(entry_hour),
+            minute=int(entry_minute),
+            timezone=pytz.timezone('US/Eastern')
+        ),
+        id='auto_entry',
+        replace_existing=True
+    )
+
+    scheduler.start()
+
+    # 次回実行時刻を取得してステータスに反映
+    job = scheduler.get_job('auto_entry')
+    next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+    set_scheduler_active(True, next_run)
 
 
 @asynccontextmanager
@@ -125,6 +170,13 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning(f'⚠️ ストリーミング開始失敗: {e}')
 
+        # 自動売買スケジューラーを起動（AUTO_EXECUTE=True かつ IBKR接続済みの場合）
+        if config.AUTO_EXECUTE and service.is_connected:
+            _setup_scheduler(service)
+            logger.info(f'✓ 自動売買スケジューラー開始（月曜 {config.ENTRY_TIME} ET）')
+        elif config.AUTO_EXECUTE and not service.is_connected:
+            logger.warning('⚠️ AUTO_EXECUTE=True だが IBKR未接続のためスケジューラーを起動しません')
+
     logger.info('FastAPI Dashboard Ready')
     logger.info('=' * 60)
 
@@ -132,6 +184,11 @@ async def lifespan(app: FastAPI):
 
     # シャットダウン処理
     logger.info('FastAPI Dashboard Shutting down...')
+
+    # スケジューラー停止
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info('✓ スケジューラー停止')
 
     if config.USE_MOCK_DATA:
         if app_state.get('ibkr_connection'):
@@ -205,6 +262,8 @@ async def health_check():
         "status": "ok",
         "ibkr_connected": is_connected,
         "mode": "mock" if config.USE_MOCK_DATA else "real",
+        "auto_execute": config.AUTO_EXECUTE,
+        "scheduler_running": scheduler.running,
         "timestamp": datetime.now(pytz.UTC).isoformat()
     }
 
