@@ -80,6 +80,16 @@ MAX_SLIPPAGE = 0.10            # 許容スリッページ
 STOP_LOSS_MULTIPLIER = 2.0    # エントリープレミアムの2倍で損切り
 # 例: $1.50で入った場合、スプレッドプレミアムが$3.00に届いたら損切り
 
+# 利確設定
+PROFIT_TAKE_THRESHOLD = 0.50  # 最大利益の50%で早期クローズ
+# 例: $1.50で入った場合、買い戻しコストが$0.75以下になったら利確
+ENABLE_PROFIT_TAKE = True     # 自動利確を有効化
+
+# 買い増し設定
+ENABLE_ADD_POSITION = False   # 買い増しを有効化（ペーパー口座で動作確認後 True にする）
+PROFIT_ADD_THRESHOLD = 0.50   # ポジションがこの%以上の利益になったら買い増し検討
+MAX_OPEN_POSITIONS = 2        # 同時オープンポジションの上限（買い増し上限制御）
+
 # Fear & Greed Index
 FEAR_GREED_API_URL = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata'
 FEAR_GREED_TIMEOUT = 10        # 取得タイムアウト（秒）

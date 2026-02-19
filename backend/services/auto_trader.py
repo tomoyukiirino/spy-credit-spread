@@ -368,7 +368,7 @@ def _monitor_positions_sync(ib) -> list:
     Returns:
         実行したアクションのリスト
     """
-    from ib_insync import Stock, Option, MarketOrder
+    from ib_insync import Stock, Option, MarketOrder, LimitOrder
     from position import PositionManager
 
     actions = []
@@ -448,12 +448,18 @@ def _monitor_positions_sync(ib) -> list:
                 logger.warning(f'{spread_id}: オプション価格取得失敗、損切りチェックスキップ')
                 continue
 
-            # 損切り判定
+            # 現在の利益率を計算
+            # credit spread: 受取金額(entry) - 現在の買い戻しコスト(current) = 利益
+            current_profit = entry_premium - current_net_premium
+            profit_pct = current_profit / entry_premium if entry_premium > 0 else 0
+
+            # === 損切り判定 ===
             should_close = False
-            reason = None
+            close_action = None
 
             if current_net_premium >= stop_loss_threshold:
                 should_close = True
+                close_action = 'STOP_LOSS'
                 reason = (
                     f'プレミアム{config.STOP_LOSS_MULTIPLIER}倍到達 '
                     f'(entry: ${entry_premium:.2f} → current: ${current_net_premium:.2f})'
@@ -461,26 +467,75 @@ def _monitor_positions_sync(ib) -> list:
 
             elif spy_price < short_strike * 0.98:
                 should_close = True
+                close_action = 'STOP_LOSS'
                 reason = (
                     f'SPY価格がショートストライク98%を下回った '
                     f'(SPY: ${spy_price:.2f} < ${short_strike * 0.98:.2f})'
                 )
 
+            # === 利確判定（損切り条件を満たさない場合のみ）===
+            elif config.ENABLE_PROFIT_TAKE and profit_pct >= config.PROFIT_TAKE_THRESHOLD:
+                should_close = True
+                close_action = 'PROFIT_TAKE'
+                reason = (
+                    f'利確: 最大利益の{profit_pct*100:.0f}%到達 '
+                    f'(entry: ${entry_premium:.2f} → current: ${current_net_premium:.2f})'
+                )
+
             if not should_close:
                 logger.info(
                     f'{spread_id}: 正常 | '
-                    f'premium ${current_net_premium:.2f} (threshold ${stop_loss_threshold:.2f}) | '
+                    f'profit {profit_pct*100:.0f}% (${current_profit:.2f}) | '
+                    f'premium ${current_net_premium:.2f} | '
                     f'SPY ${spy_price:.2f} vs strike ${short_strike:.2f}'
                 )
+
+                # === 買い増し判定（クローズしない場合）===
+                # ポジションが一定以上の利益 かつ オープンポジション数が上限未満の場合
+                if config.ENABLE_ADD_POSITION and profit_pct >= config.PROFIT_ADD_THRESHOLD:
+                    open_count = len(pm.get_open_positions())
+                    if open_count < config.MAX_OPEN_POSITIONS:
+                        logger.info(
+                            f'{spread_id}: 買い増し条件達成 '
+                            f'(profit {profit_pct*100:.0f}%, positions {open_count}/{config.MAX_OPEN_POSITIONS})'
+                        )
+                        actions.append({
+                            'spread_id': spread_id,
+                            'action': 'ADD_POSITION_SIGNAL',
+                            'reason': f'利益{profit_pct*100:.0f}%到達、買い増し条件充足',
+                            'profit_pct': profit_pct,
+                            'open_positions': open_count,
+                        })
+                        # 買い増しエントリーを実行（エントリーロジックを再利用）
+                        try:
+                            add_result = _execute_entry_sync(ib)
+                            if add_result.get('success'):
+                                spread = add_result['spread']
+                                logger.info(
+                                    f'買い増し完了: {spread["short_strike"]}/{spread["long_strike"]} '
+                                    f'x{add_result["quantity"]}枚'
+                                )
+                                actions[-1]['add_entry_result'] = add_result
+                            else:
+                                logger.warning(f'買い増し見送り: {add_result.get("reason")}')
+                                actions[-1]['add_entry_result'] = add_result
+                        except Exception as ae:
+                            logger.error(f'買い増しエラー: {ae}')
                 continue
 
-            # 損切り実行: 成行で即時クローズ
-            logger.warning(f'🚨 損切り発動: {spread_id} | 理由: {reason}')
+            # クローズ実行: 損切りは成行、利確は指値（よりよい価格で埋まるように）
+            if close_action == 'STOP_LOSS':
+                log_prefix = '🚨 損切り発動'
+                close_short = MarketOrder('BUY', quantity, transmit=False)
+                close_long = MarketOrder('SELL', quantity, transmit=True)
+            else:  # PROFIT_TAKE
+                log_prefix = '✅ 利確発動'
+                # 利確は指値（mid近辺で買い戻し）
+                close_price = round(current_net_premium + 0.02, 2)
+                close_short = LimitOrder('BUY', quantity, close_price, transmit=False)
+                close_long = LimitOrder('SELL', quantity, round(long_mid - 0.02, 2) if long_mid else close_price, transmit=True)
 
-            # ショートプット: Buy-to-close（成行）
-            close_short = MarketOrder('BUY', quantity, transmit=False)
-            # ロングプット: Sell-to-close（成行、同時送信）
-            close_long = MarketOrder('SELL', quantity, transmit=True)
+            logger.warning(f'{log_prefix}: {spread_id} | 理由: {reason}')
 
             trade_short = ib.placeOrder(short_put, close_short)
             trade_long = ib.placeOrder(long_put, close_long)
@@ -494,8 +549,9 @@ def _monitor_positions_sync(ib) -> list:
 
             actions.append({
                 'spread_id': spread_id,
-                'action': 'STOP_LOSS',
+                'action': close_action,
                 'reason': reason,
+                'profit_pct': profit_pct,
                 'current_net_premium': current_net_premium,
                 'entry_premium': entry_premium,
                 'spy_price': spy_price,
