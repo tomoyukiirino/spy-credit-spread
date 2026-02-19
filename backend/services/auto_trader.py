@@ -352,3 +352,195 @@ async def run_auto_entry(service) -> dict:
 
     finally:
         _state['is_running'] = False
+
+
+def _monitor_positions_sync(ib) -> list:
+    """
+    IBKR worker thread内で実行されるポジション監視・損切りコア処理
+
+    損切り条件:
+    1. 現在のネットプレミアム >= エントリープレミアム × STOP_LOSS_MULTIPLIER（デフォルト2倍）
+    2. SPY価格 < ショートストライク × 0.98（ストライクの2%下）
+
+    Args:
+        ib: IB instance
+
+    Returns:
+        実行したアクションのリスト
+    """
+    from ib_insync import Stock, Option, MarketOrder
+    from position import PositionManager
+
+    actions = []
+    pm = PositionManager()
+    open_positions = pm.get_open_positions()
+
+    if not open_positions:
+        logger.info('ポジション監視: オープンポジションなし')
+        return actions
+
+    logger.info(f'ポジション監視: {len(open_positions)}件チェック')
+
+    # SPY価格を一度だけ取得
+    spy = Stock('SPY', 'SMART', 'USD')
+    ib.qualifyContracts(spy)
+    ib.reqMktData(spy, '', False, False)
+    ib.sleep(2)
+    spy_ticker = ib.ticker(spy)
+    ib.cancelMktData(spy)
+
+    spy_price = spy_ticker.last
+    if not spy_price or math.isnan(spy_price):
+        mid = (spy_ticker.bid + spy_ticker.ask) / 2 if (spy_ticker.bid and spy_ticker.ask) else None
+        spy_price = mid
+
+    if not spy_price:
+        logger.warning('ポジション監視: SPY価格取得失敗、スキップ')
+        return actions
+
+    logger.info(f'ポジション監視: SPY ${spy_price:.2f}')
+
+    for spread_id, position in open_positions.items():
+        try:
+            short_strike = float(position['short_strike'])
+            long_strike = float(position['long_strike'])
+            quantity = int(position['quantity'])
+            entry_premium = float(position['entry_premium'])
+            # expiration フィールドは YYYYMMDD 形式（position.py の add_position 参照）
+            expiration = position.get('expiration', position.get('expiry', ''))
+            expiration = expiration.replace('-', '')  # YYYY-MM-DD → YYYYMMDD
+
+            stop_loss_threshold = entry_premium * config.STOP_LOSS_MULTIPLIER
+
+            # 現在のオプション価格を取得（ショート + ロング）
+            short_put = Option('SPY', expiration, short_strike, 'P', 'SMART', tradingClass='SPY')
+            long_put = Option('SPY', expiration, long_strike, 'P', 'SMART', tradingClass='SPY')
+
+            try:
+                ib.qualifyContracts(short_put, long_put)
+            except Exception as qe:
+                logger.warning(f'{spread_id}: contract検証失敗 ({qe}), スキップ')
+                continue
+
+            short_ticker = ib.reqMktData(short_put, '', False, False)
+            long_ticker = ib.reqMktData(long_put, '', False, False)
+            ib.sleep(3)
+            ib.cancelMktData(short_put)
+            ib.cancelMktData(long_put)
+
+            def _mid(t):
+                bid = t.bid if t.bid and not math.isnan(t.bid) and t.bid > 0 else None
+                ask = t.ask if t.ask and not math.isnan(t.ask) and t.ask > 0 else None
+                last = t.last if t.last and not math.isnan(t.last) and t.last > 0 else None
+                if bid and ask:
+                    return (bid + ask) / 2
+                return last
+
+            short_mid = _mid(short_ticker)
+            long_mid = _mid(long_ticker)
+
+            # 現在のネットプレミアム（Buy-to-close コスト）
+            if short_mid and long_mid:
+                current_net_premium = short_mid - long_mid
+            elif short_mid:
+                current_net_premium = short_mid
+            else:
+                logger.warning(f'{spread_id}: オプション価格取得失敗、損切りチェックスキップ')
+                continue
+
+            # 損切り判定
+            should_close = False
+            reason = None
+
+            if current_net_premium >= stop_loss_threshold:
+                should_close = True
+                reason = (
+                    f'プレミアム{config.STOP_LOSS_MULTIPLIER}倍到達 '
+                    f'(entry: ${entry_premium:.2f} → current: ${current_net_premium:.2f})'
+                )
+
+            elif spy_price < short_strike * 0.98:
+                should_close = True
+                reason = (
+                    f'SPY価格がショートストライク98%を下回った '
+                    f'(SPY: ${spy_price:.2f} < ${short_strike * 0.98:.2f})'
+                )
+
+            if not should_close:
+                logger.info(
+                    f'{spread_id}: 正常 | '
+                    f'premium ${current_net_premium:.2f} (threshold ${stop_loss_threshold:.2f}) | '
+                    f'SPY ${spy_price:.2f} vs strike ${short_strike:.2f}'
+                )
+                continue
+
+            # 損切り実行: 成行で即時クローズ
+            logger.warning(f'🚨 損切り発動: {spread_id} | 理由: {reason}')
+
+            # ショートプット: Buy-to-close（成行）
+            close_short = MarketOrder('BUY', quantity, transmit=False)
+            # ロングプット: Sell-to-close（成行、同時送信）
+            close_long = MarketOrder('SELL', quantity, transmit=True)
+
+            trade_short = ib.placeOrder(short_put, close_short)
+            trade_long = ib.placeOrder(long_put, close_long)
+            ib.sleep(5)
+
+            short_close_status = trade_short.orderStatus.status if trade_short else 'Unknown'
+            long_close_status = trade_long.orderStatus.status if trade_long else 'Unknown'
+
+            close_ok = short_close_status in ('Submitted', 'Filled', 'PreSubmitted') and \
+                       long_close_status in ('Submitted', 'Filled', 'PreSubmitted')
+
+            actions.append({
+                'spread_id': spread_id,
+                'action': 'STOP_LOSS',
+                'reason': reason,
+                'current_net_premium': current_net_premium,
+                'entry_premium': entry_premium,
+                'spy_price': spy_price,
+                'close_order_ok': close_ok,
+                'order_status': f'Short: {short_close_status}, Long: {long_close_status}',
+            })
+
+            if close_ok:
+                # PositionManager にクローズを記録
+                try:
+                    pm.close_position(spread_id, exit_premium=current_net_premium, fx_rate=None)
+                except Exception as pe:
+                    logger.warning(f'{spread_id}: position close記録失敗: {pe}')
+                logger.warning(f'✓ {spread_id}: 損切りクローズ完了')
+            else:
+                logger.error(f'✗ {spread_id}: 損切り注文ステータス異常 {short_close_status}/{long_close_status}')
+
+        except Exception as e:
+            logger.error(f'{spread_id}: 監視中エラー: {e}')
+
+    return actions
+
+
+async def run_position_monitor(service) -> list:
+    """
+    ポジション監視を実行（スケジューラーから15分おきに呼び出し）
+
+    Args:
+        service: IBKRService instance
+
+    Returns:
+        実行したアクションのリスト
+    """
+    if not service or not service.is_connected:
+        return []
+
+    if _state['is_running']:
+        logger.info('ポジション監視: エントリー実行中のためスキップ')
+        return []
+
+    try:
+        actions = await service.execute_timeout(60, _monitor_positions_sync, service.ib)
+        if actions:
+            logger.warning(f'ポジション監視: {len(actions)}件の損切りを実行')
+        return actions
+    except Exception as e:
+        logger.error(f'ポジション監視エラー: {e}')
+        return []

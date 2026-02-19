@@ -99,6 +99,27 @@ def _setup_scheduler(service):
         replace_existing=True
     )
 
+    # ポジション監視: 平日マーケット時間中（9:30〜16:15 ET）に15分おき
+    async def _scheduled_monitor():
+        from backend.services.auto_trader import run_position_monitor
+        _logger = get_logger()
+        actions = await run_position_monitor(service)
+        if actions:
+            for a in actions:
+                _logger.warning(f'[監視] 損切り実行: {a["spread_id"]} | {a["reason"]}')
+
+    scheduler.add_job(
+        _scheduled_monitor,
+        CronTrigger(
+            day_of_week='mon-fri',
+            hour='9-16',
+            minute='*/15',
+            timezone=pytz.timezone('US/Eastern')
+        ),
+        id='position_monitor',
+        replace_existing=True
+    )
+
     scheduler.start()
 
     # 次回実行時刻を取得してステータスに反映
